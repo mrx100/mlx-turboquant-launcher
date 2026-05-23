@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/hasan/workspace/mlx-studio/.venv/bin/python3
 """TurboQuant MLX Launcher & Server — single script.
 
 Supports:
@@ -11,6 +11,18 @@ Usage:
   mlx-turboquant.py --list       list available models
   mlx-turboquant.py --serve      start with saved defaults (non-interactive)
 """
+
+# Auto-switch to venv if mlx_lm not available
+try:
+    import mlx_lm
+except ImportError:
+    import os, subprocess, sys
+    _venv = os.path.expanduser("~/workspace/mlx-studio/.venv/bin/python3")
+    if os.path.exists(_venv):
+        os.execv(_venv, [_venv] + sys.argv)
+    else:
+        print("✗ mlx_lm not found. Install it or set the venv path in the script.")
+        sys.exit(1)
 
 import os, sys, json, time, uuid, asyncio, re, shutil, atexit, signal
 from pathlib import Path
