@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.yarn_config_*/
+.tq_defaults.json
