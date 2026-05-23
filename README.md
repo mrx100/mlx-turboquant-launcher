@@ -9,6 +9,8 @@ Production-grade MLX model server with **TurboQuant KV-Cache Compression** and *
 **Hardware:** MacBook Pro M1 Max, 32 GB RAM
 
 ![Asteroids Game](screenshot.png)
+![Asteroids Game 2](screenshot2.png)
+![Asteroids Game 3](screenshot3.png)
 
 | Metric | Value |
 |--------|-------|
