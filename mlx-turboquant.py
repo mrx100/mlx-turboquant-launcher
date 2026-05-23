@@ -1,9 +1,10 @@
-#!/Users/hasan/workspace/mlx-studio/.venv/bin/python3
+#!/usr/bin/env python3
 """TurboQuant MLX Launcher & Server — single script.
 
 Supports:
 - Pure SDPA models (Llama, Mistral, Gemma): full TurboQuant KV-cache compression
 - Hybrid GDN+SDPA models (Qwen 3.5, Qwen 3.6): TurboQuant on softmax layers only
+- YaRN context extension beyond native limits (up to 1M+ tokens)
 
 Usage:
   mlx-turboquant.py              interactive launcher
@@ -11,7 +12,7 @@ Usage:
   mlx-turboquant.py --serve      start with saved defaults (non-interactive)
 """
 
-import os, sys, json, time, uuid, asyncio, re, shutil, atexit
+import os, sys, json, time, uuid, asyncio, re, shutil, atexit, signal
 from pathlib import Path
 
 _MODELS_DIR = Path.home() / ".lmstudio/models"
@@ -470,6 +471,8 @@ def _start_server(cfg):
     ctx_size = cfg.get("ctx_size", 8192)
     if ctx_size > _NATIVE_MAX_CONTEXT:
         arch_label += f" + YaRN ({ctx_size/_NATIVE_MAX_CONTEXT:.1f}x)"
+    elif ctx_size > 0 and ctx_size != _NATIVE_MAX_CONTEXT:
+        pass  # Within native range
 
     print(f"Model loaded: {n_layers} layers, head_dim={head_dim}")
     if is_hybrid:
@@ -546,7 +549,7 @@ def _start_server(cfg):
 
                 if stream:
                     header = f"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
-                    w.write(header.encode()); await w.drain()
+                    if not await safe_write(w, header.encode()): return
 
                     tokens_out = []
                     thinking_done = False
@@ -569,7 +572,7 @@ def _start_server(cfg):
                                         "created": int(time.time()), "model": Path(model_path).name,
                                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
                                     })
-                                    w.write(f"data: {chunk}\n\n".encode()); await w.drain()
+                                    if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
                             elif re.match(r"^(?:.*\n)?(?:Here's\s+a\s+)?[Tt]hinking\s+[Pp]rocess:\s*\n", thinking_buffer):
                                 lines_think = thinking_buffer.split('\n')
                                 for line in lines_think:
@@ -586,23 +589,24 @@ def _start_server(cfg):
                                             "created": int(time.time()), "model": Path(model_path).name,
                                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
                                         })
-                                        w.write(f"data: {chunk}\n\n".encode()); await w.drain()
+                                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
                                         break
-                            continue
+                                if not thinking_done:
+                                    continue
 
                         chunk = json.dumps({
                             "id": cmpl_id, "object": "chat.completion.chunk",
                             "created": int(time.time()), "model": Path(model_path).name,
                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
                         })
-                        w.write(f"data: {chunk}\n\n".encode()); await w.drain()
+                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
 
                     final = json.dumps({
                         "id": cmpl_id, "object": "chat.completion.chunk",
                         "created": int(time.time()), "model": Path(model_path).name,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     })
-                    w.write(f"data: {final}\n\ndata: [DONE]\n\n".encode()); await w.drain()
+                    await safe_write(w, f"data: {final}\n\ndata: [DONE]\n\n".encode())
                     w.close(); await w.wait_closed()
                     return
 
@@ -618,7 +622,7 @@ def _start_server(cfg):
                     "id": cmpl_id, "object": "chat.completion",
                     "created": int(time.time()), "model": Path(model_path).name,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": len(tokens_out), "total_tokens": len(tokens_out)},
+                    "usage": {"prompt_tokens": len(prompt_ids), "completion_tokens": len(tokens_out), "total_tokens": len(prompt_ids) + len(tokens_out)},
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
                 w.write(rdata.encode()); await w.drain(); return
@@ -640,6 +644,17 @@ def _start_server(cfg):
             except: pass
 
     async def serve():
+        loop = asyncio.get_event_loop()
+        shutdown_event = asyncio.Event()
+
+        def _signal_handler():
+            print("\n  Shutting down gracefully...")
+            shutdown_event.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try: loop.add_signal_handler(sig, _signal_handler)
+            except: pass
+
         print()
         print("=" * 54)
         print("  TurboQuant MLX Server")
@@ -656,7 +671,14 @@ def _start_server(cfg):
         srv = await asyncio.start_server(handle, host, port)
         addr = srv.sockets[0].getsockname()
         print(f"  Listening on {addr[0]}:{addr[1]}")
-        async with srv: await srv.serve_forever()
+        print("  Press Ctrl+C to stop\n")
+        try:
+            await shutdown_event.wait()
+        except asyncio.CancelledError:
+            pass
+        srv.close()
+        await srv.wait_closed()
+        print("  Server stopped.")
 
     asyncio.run(serve())
 
