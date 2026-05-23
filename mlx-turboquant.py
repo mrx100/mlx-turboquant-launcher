@@ -461,7 +461,23 @@ def _start_server(cfg):
             if head_dim is None:
                 cfg_path = Path(model_path) / "config.json"
                 if cfg_path.exists():
-                    head_dim = json.loads(cfg_path.read_text()).get('head_dim') or (json.loads(cfg_path.read_text()).get('text_config') or {}).get('head_dim')
+                    cfg_data = json.loads(cfg_path.read_text())
+                    head_dim = cfg_data.get('head_dim')
+                    if head_dim is None:
+                        tc = cfg_data.get('text_config', {})
+                        if isinstance(tc, dict):
+                            head_dim = tc.get('head_dim')
+                    # GLM/DeepSeek: qk_nope_head_dim + qk_rope_head_dim
+                    if head_dim is None:
+                        nope = cfg_data.get('qk_nope_head_dim')
+                        rope = cfg_data.get('qk_rope_head_dim')
+                        if nope and rope:
+                            head_dim = nope + rope
+                    if head_dim is None:
+                        hidden = cfg_data.get('hidden_size')
+                        n_heads = cfg_data.get('num_attention_heads')
+                        if hidden and n_heads:
+                            head_dim = hidden // n_heads
 
     if head_dim is None:
         print("✗ Could not determine head_dim")
