@@ -6,10 +6,13 @@ Production-grade MLX model server with **TurboQuant KV-Cache Compression** and *
 
 > Qwen3.6-35B generated a complete, playable Asteroids game with visual and sound effects in a single HTML file — **11,757 tokens at 1M YaRN-extended context, 24.4 tok/s**.
 
+**Hardware:** MacBook Pro M1 Max, 32 GB RAM
+
 ![Asteroids Game](screenshot.png)
 
 | Metric | Value |
 |--------|-------|
+| Hardware | MacBook Pro M1 Max, 32 GB RAM |
 | Model | Qwen3.6-35B-A3B-UD-MLX-4bit |
 | Context | 1,048,576 (4x YaRN) |
 | Tokens Generated | 11,757 |
