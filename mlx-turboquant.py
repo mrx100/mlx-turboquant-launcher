@@ -91,6 +91,8 @@ class ServerStats:
         self.last_request_time = None
         self.last_error = None
         self.requests_by_status = {"200": 0, "400": 0, "500": 0}
+        self.async_quant_ops = 0
+        self.async_sync_fallbacks = 0
 
     def record_request(self, status_code, tokens=0, duration=0):
         self.total_requests += 1
@@ -141,6 +143,8 @@ class ServerStats:
             "bad_requests": self.bad_requests,
             "requests_by_status": dict(self.requests_by_status),
             "last_error": self.last_error,
+            "async_quant_ops": self.async_quant_ops,
+            "async_sync_fallbacks": self.async_sync_fallbacks,
         }
 
     def save(self):
@@ -162,6 +166,8 @@ class ServerStats:
         logger.info(f"  Errors:          {s['errors']}")
         logger.info(f"  Connection Resets: {s['connection_resets']}")
         logger.info(f"  Bad Requests:    {s['bad_requests']}")
+        logger.info(f"  Async Quant Ops: {s.get('async_quant_ops', 0)}")
+        logger.info(f"  Async Fallbacks: {s.get('async_sync_fallbacks', 0)}")
         if s.get('last_error'):
             logger.info(f"  Last Error:      {s['last_error']}")
         logger.info("=" * 60)
@@ -181,6 +187,7 @@ _DEFAULTS = {
     "quantized_kv_start": 512,
     "prompt_cache_dir": None,
     "use_rotation": True, "use_normalization": True,
+    "use_async_cache": True,
 }
 
 _CONTEXT_PRESETS = [
@@ -293,19 +300,21 @@ def _detect_architecture(model):
 
 # ── Hybrid Cache Factory ────────────────────────────────────────────
 
-def _create_hybrid_cache(model, strategy, head_dim, k_bits=4, v_bits=2):
+def _create_hybrid_cache(model, strategy, head_dim, k_bits=4, v_bits=2, use_async=False):
     """Create cache list appropriate for the model's architecture.
 
     Pure SDPA: all layers get TurboQuant caches.
     Hybrid GDN+SDPA: softmax layers get TurboQuant, GDN layers get stubs.
 
     Supports asymmetric K/V bit allocation for optimized memory/quality.
+    Supports async double-buffered quantization for pipelined performance.
     """
     import mlx.core as mx
     import mlx_lm
     from mlx_lm.models.cache import make_prompt_cache
     from turboquant.cache import TurboQuantKVCache
     from turboquant.cache_v2 import TurboQuantKVCacheV2
+    from turboquant.cache_v2_async import AsyncTurboQuantKVCacheV2
     from turboquant.cache_v3 import TurboQuantKVCacheV3
 
     is_hybrid, softmax_indices, gdn_indices = _detect_architecture(model)
@@ -319,27 +328,28 @@ def _create_hybrid_cache(model, strategy, head_dim, k_bits=4, v_bits=2):
         cache_list = []
         for i in range(n_layers):
             if i in softmax_indices:
+                cache_cls = AsyncTurboQuantKVCacheV2 if use_async else TurboQuantKVCacheV2
                 if strategy == "tq_4bit":
-                    cache = TurboQuantKVCacheV2(
+                    cache = cache_cls(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=True, use_normalization=True,
                         k_bits=k_bits, v_bits=v_bits,
                     )
                 elif strategy == "tq_4bit_fast":
-                    cache = TurboQuantKVCacheV2(
+                    cache = cache_cls(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=False, use_normalization=False,
                         k_bits=k_bits, v_bits=v_bits,
                     )
                 elif strategy == "tq_3bit":
-                    cache = TurboQuantKVCacheV2(
+                    cache = cache_cls(
                         head_dim=head_dim, bits=3, group_size=64,
                         use_rotation=True, use_normalization=True,
                         use_qjl=True,
                         k_bits=k_bits, v_bits=v_bits,
                     )
                 else:
-                    cache = TurboQuantKVCacheV2(
+                    cache = cache_cls(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=True, use_normalization=True,
                         k_bits=k_bits, v_bits=v_bits,
@@ -350,10 +360,15 @@ def _create_hybrid_cache(model, strategy, head_dim, k_bits=4, v_bits=2):
         return cache_list, is_hybrid, softmax_indices, gdn_indices
 
     # Pure SDPA model: all layers get TurboQuant
+    if use_async:
+        cache_cls = AsyncTurboQuantKVCacheV2
+    else:
+        cache_cls = TurboQuantKVCacheV2
+    
     opts = {
-        "v2_4bit_lean": lambda: [TurboQuantKVCache(head_dim=head_dim, mse_bits=4, use_qjl=False) for _ in range(n_layers)],
-        "v2_4bit_rotated": lambda: [TurboQuantKVCache(head_dim=head_dim, mse_bits=4, use_qjl=True) for _ in range(n_layers)],
-        "v2_3bit_qjl": lambda: [TurboQuantKVCache(head_dim=head_dim, mse_bits=3, use_qjl=True) for _ in range(n_layers)],
+        "v2_4bit_lean": lambda: [cache_cls(head_dim=head_dim, bits=4, group_size=64, use_rotation=False, use_normalization=False, k_bits=k_bits, v_bits=v_bits) for _ in range(n_layers)],
+        "v2_4bit_rotated": lambda: [cache_cls(head_dim=head_dim, bits=4, group_size=64, use_rotation=True, use_normalization=True, k_bits=k_bits, v_bits=v_bits) for _ in range(n_layers)],
+        "v2_3bit_qjl": lambda: [cache_cls(head_dim=head_dim, bits=3, group_size=64, use_rotation=True, use_normalization=True, use_qjl=True, k_bits=k_bits, v_bits=v_bits) for _ in range(n_layers)],
         "v3_35bit_mixed": lambda: [TurboQuantKVCacheV3(head_dim=head_dim, bits=3, n_outlier=64, outlier_bits=4) for _ in range(n_layers)],
         "v3_3bit_lloyd": lambda: [TurboQuantKVCacheV3(head_dim=head_dim, bits=3) for _ in range(n_layers)],
         "v3_25bit_mixed": lambda: [TurboQuantKVCacheV3(head_dim=head_dim, bits=2, n_outlier=64, outlier_bits=3) for _ in range(n_layers)],
@@ -685,6 +700,7 @@ def _start_server(cfg):
     kv_group_size = cfg.get("kv_group_size", 64)
     quantized_kv_start = cfg.get("quantized_kv_start", 512)
     prompt_cache_dir = cfg.get("prompt_cache_dir", None)
+    use_async_cache = cfg.get("use_async_cache", True)
 
     # Persistent prompt cache setup
     _prompt_cache = {"dir": None, "loaded": False}
@@ -747,6 +763,7 @@ def _start_server(cfg):
         pass  # Within native range
 
     print(f"Model loaded: {n_layers} layers, head_dim={head_dim}")
+    print(f"  Async cache: {'enabled' if use_async_cache else 'disabled'}")
     if is_hybrid:
         print(f"  Architecture: {arch_label}")
         print(f"  Softmax layers: {len(softmax_indices)} (compressed)")
@@ -791,6 +808,7 @@ def _start_server(cfg):
                     "v_bits": v_bits,
                     "quantized_kv_start": quantized_kv_start,
                     "prompt_cache": bool(_prompt_cache["dir"]),
+                    "use_async_cache": use_async_cache,
                     "stats": _server_stats.get_summary(),
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
@@ -829,7 +847,7 @@ def _start_server(cfg):
                 mt = payload.get("max_tokens") or max_tokens
                 tp = payload.get("temperature") or temperature
                 stream = payload.get("stream", False)
-                cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim, k_bits, v_bits)
+                cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim, k_bits, v_bits, use_async_cache)
 
                 # Apply MLX native KV quantization (works with ALL models)
                 if strategy == "none" and k_bits > 0:
@@ -943,6 +961,19 @@ def _start_server(cfg):
                     duration = time.time() - req_start
                     _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
                     logger.info(f"Stream completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
+
+                    # Collect async cache statistics
+                    if use_async_cache:
+                        async_ops = 0
+                        async_fallbacks = 0
+                        for c in cache:
+                            if hasattr(c, 'async_stats'):
+                                async_ops += c.async_stats.get('async_ops_count', 0)
+                                async_fallbacks += c.async_stats.get('sync_fallback_count', 0)
+                        _server_stats.async_quant_ops = async_ops
+                        _server_stats.async_sync_fallbacks = async_fallbacks
+                        if async_ops > 0:
+                            logger.info(f"  Async quantization: {async_ops} ops, {async_fallbacks} sync fallbacks")
                     return
 
                 # Non-streaming mode
@@ -967,6 +998,19 @@ def _start_server(cfg):
                 duration = time.time() - req_start
                 _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
                 logger.info(f"Request completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
+
+                # Collect async cache statistics
+                if use_async_cache:
+                    async_ops = 0
+                    async_fallbacks = 0
+                    for c in cache:
+                        if hasattr(c, 'async_stats'):
+                            async_ops += c.async_stats.get('async_ops_count', 0)
+                            async_fallbacks += c.async_stats.get('sync_fallback_count', 0)
+                    _server_stats.async_quant_ops = async_ops
+                    _server_stats.async_sync_fallbacks = async_fallbacks
+                    if async_ops > 0:
+                        logger.info(f"  Async quantization: {async_ops} ops, {async_fallbacks} sync fallbacks")
 
                 # Save prompt cache for future requests
                 if _prompt_cache["dir"] and not _prompt_cache["loaded"]:
