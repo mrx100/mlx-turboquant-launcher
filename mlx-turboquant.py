@@ -35,7 +35,9 @@ _DEFAULTS = {
     "model": None, "port": 8081, "host": "0.0.0.0",
     "max_tokens": 2048, "temperature": 0.7,
     "tq_strategy": "v2_4bit_rotated", "ctx_size": 8192,
-    "kv_bits": 4, "kv_group_size": 64,
+    "k_bits": 4, "v_bits": 2, "kv_group_size": 64,
+    "quantized_kv_start": 512,
+    "prompt_cache_dir": None,
     "use_rotation": True, "use_normalization": True,
 }
 
@@ -149,11 +151,13 @@ def _detect_architecture(model):
 
 # ── Hybrid Cache Factory ────────────────────────────────────────────
 
-def _create_hybrid_cache(model, strategy, head_dim):
+def _create_hybrid_cache(model, strategy, head_dim, k_bits=4, v_bits=2):
     """Create cache list appropriate for the model's architecture.
 
     Pure SDPA: all layers get TurboQuant caches.
     Hybrid GDN+SDPA: softmax layers get TurboQuant, GDN layers get stubs.
+
+    Supports asymmetric K/V bit allocation for optimized memory/quality.
     """
     import mlx.core as mx
     import mlx_lm
@@ -177,22 +181,26 @@ def _create_hybrid_cache(model, strategy, head_dim):
                     cache = TurboQuantKVCacheV2(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=True, use_normalization=True,
+                        k_bits=k_bits, v_bits=v_bits,
                     )
                 elif strategy == "tq_4bit_fast":
                     cache = TurboQuantKVCacheV2(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=False, use_normalization=False,
+                        k_bits=k_bits, v_bits=v_bits,
                     )
                 elif strategy == "tq_3bit":
                     cache = TurboQuantKVCacheV2(
                         head_dim=head_dim, bits=3, group_size=64,
                         use_rotation=True, use_normalization=True,
                         use_qjl=True,
+                        k_bits=k_bits, v_bits=v_bits,
                     )
                 else:
                     cache = TurboQuantKVCacheV2(
                         head_dim=head_dim, bits=4, group_size=64,
                         use_rotation=True, use_normalization=True,
+                        k_bits=k_bits, v_bits=v_bits,
                     )
             else:
                 cache = GDNPassThroughCache()
@@ -302,6 +310,69 @@ def _pick_float(prompt, default):
     v = input(f"  {prompt} [{default}]: ").strip()
     try: return float(v) if v else default
     except: return default
+
+
+def _pick_kv_bits(cfg):
+    """Select asymmetric K/V cache quantization bits.
+
+    Keys (K) are sensitive to quantization — 4-bit recommended for TurboQuant.
+    Values (V) tolerate lower precision — 2-bit works well.
+    """
+    k_bits = cfg.get("k_bits", 4)
+    v_bits = cfg.get("v_bits", 2)
+
+    print()
+    print("  Asymmetric KV-Cache quantization:")
+    print("  Keys (K) are sensitive to quantization; Values (V) tolerate lower bits.")
+    print()
+    print("  K-bit options (Keys — used in softmax Q·K^T, needs precision):")
+    k_options = {"1": (2, "2-bit — 8x compression (aggressive)"), "2": (4, "4-bit — 4x compression (Recommended)"), "3": (8, "8-bit — 2x compression (highest quality)")}
+    for k, (v, d) in k_options.items():
+        m = " (current)" if v == k_bits else ""
+        print(f"  {k}) [{v}-bit K] — {d}{m}")
+    k_choice = input(f"  K bits [2]: ").strip() or "2"
+    cfg["k_bits"] = k_options.get(k_choice, (4, ""))[0]
+
+    print()
+    print("  V-bit options (Values — weighted sums, more tolerant):")
+    v_options = {"1": (2, "2-bit — 8x compression (Recommended)"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression"), "4": (8, "8-bit — 2x compression (highest quality)")}
+    for k, (v, d) in v_options.items():
+        m = " (current)" if v == v_bits else ""
+        print(f"  {k}) [{v}-bit V] — {d}{m}")
+    v_choice = input(f"  V bits [1]: ").strip() or "1"
+    cfg["v_bits"] = v_options.get(v_choice, (2, ""))[0]
+
+    cfg["kv_group_size"] = cfg.get("kv_group_size", 64)
+
+
+def _pick_quantized_kv_start(cfg):
+    """Select when to start KV quantization (delays compression for better prefill)."""
+    qkv_start = cfg.get("quantized_kv_start", 512)
+
+    print()
+    print("  Quantized KV Start (delays compression to stabilize prefill):")
+    print("  First N tokens stay in FP16, then quantization kicks in.")
+    qkv_options = {"1": (0, "0 — Quantize from token 1 (max compression)"), "2": (256, "256 — Short system prompts stay precise"), "3": (512, "512 — Recommended for long contexts"), "4": (1024, "1024 — Maximum prefill quality")}
+    for k, (v, d) in qkv_options.items():
+        m = " (current)" if v == qkv_start else ""
+        print(f"  {k}) [{v}] — {d}{m}")
+    qkv_choice = input(f"  Quantized KV start [3]: ").strip() or "3"
+    cfg["quantized_kv_start"] = qkv_options.get(qkv_choice, (512, ""))[0]
+
+
+def _pick_prompt_cache(cfg):
+    """Select persistent prompt cache directory for long sessions."""
+    cache_dir = cfg.get("prompt_cache_dir", None)
+    print()
+    print("  Persistent prompt cache (survives server restarts, near-zero TTFT):")
+    default_dir = str(Path.home() / ".mlx_prompt_cache")
+    print(f"  Cache directory: {default_dir}")
+    print(f"  Current: {cache_dir or 'disabled'}")
+    choice = input(f"  Enable prompt cache? [Y/n]: ").strip().lower()
+    if choice != "n":
+        cfg["prompt_cache_dir"] = default_dir
+    else:
+        cfg["prompt_cache_dir"] = None
 
 
 def _pick_context_size(cfg, model_path):
@@ -453,8 +524,18 @@ def _start_server(cfg):
     strategy = cfg["tq_strategy"]
     host, port = cfg["host"], cfg["port"]
     max_tokens, temperature = cfg["max_tokens"], cfg["temperature"]
-    kv_bits = cfg.get("kv_bits", 0)
+    k_bits = cfg.get("k_bits", 4)
+    v_bits = cfg.get("v_bits", 2)
     kv_group_size = cfg.get("kv_group_size", 64)
+    quantized_kv_start = cfg.get("quantized_kv_start", 512)
+    prompt_cache_dir = cfg.get("prompt_cache_dir", None)
+
+    # Persistent prompt cache setup
+    _prompt_cache = {"dir": None, "loaded": False}
+    if prompt_cache_dir:
+        _prompt_cache["dir"] = Path(prompt_cache_dir)
+        _prompt_cache["dir"].mkdir(parents=True, exist_ok=True)
+        print(f"Prompt cache enabled: {_prompt_cache['dir']}")
 
     print(f"Loading model: {model_path}")
     model, tokenizer = mlx_lm.load(model_path)
@@ -549,7 +630,10 @@ def _start_server(cfg):
                     "softmax_layers": len(softmax_indices) if is_hybrid else n_layers,
                     "gdn_layers": len(gdn_indices),
                     "head_dim": head_dim,
-                    "kv_bits": kv_bits if kv_bits > 0 else None,
+                    "k_bits": k_bits,
+                    "v_bits": v_bits,
+                    "quantized_kv_start": quantized_kv_start,
+                    "prompt_cache": bool(_prompt_cache["dir"]),
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
                 w.write(rdata.encode()); await w.drain(); return
@@ -571,20 +655,40 @@ def _start_server(cfg):
                 mt = payload.get("max_tokens") or max_tokens
                 tp = payload.get("temperature") or temperature
                 stream = payload.get("stream", False)
-                cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim)
+                cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim, k_bits, v_bits)
 
                 # Apply MLX native KV quantization (works with ALL models)
-                if kv_bits > 0 and strategy == "none":
+                if strategy == "none" and k_bits > 0:
                     try:
                         from mlx_lm.generate import maybe_quantize_kv_cache
-                        maybe_quantize_kv_cache(cache, 0, kv_group_size, kv_bits)
+                        maybe_quantize_kv_cache(cache, quantized_kv_start, kv_group_size, k_bits)
                     except Exception as e:
                         print(f"  ⚠ KV quantization not supported for this model: {e}")
-                        print(f"  Falling back to full precision KV cache")
-                        cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim)
+                        cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim, k_bits, v_bits)
 
                 formatted = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 prompt_ids = mx.array(tokenizer.encode(formatted))
+
+                # Prompt cache: try to load persisted cache
+                if _prompt_cache["dir"]:
+                    import hashlib
+                    prompt_hash = hashlib.sha256(formatted.encode()).hexdigest()[:16]
+                    cache_file = _prompt_cache["dir"] / f"{prompt_hash}.safetensors"
+                    if cache_file.exists():
+                        try:
+                            from mlx_lm.models.cache import load_prompt_cache
+                            loaded = load_prompt_cache(str(cache_file))
+                            if loaded and len(loaded) == len(cache):
+                                for i, c in enumerate(loaded):
+                                    if hasattr(c, 'offset') and hasattr(cache[i], 'offset'):
+                                        cache[i].offset = c.offset
+                                        if hasattr(c, 'keys') and c.keys is not None:
+                                            cache[i].keys = c.keys
+                                            cache[i].values = c.values
+                                print(f"  Loaded prompt cache: {cache_file.name}")
+                                _prompt_cache["loaded"] = True
+                        except Exception as e:
+                            print(f"  ⚠ Failed to load prompt cache: {e}")
 
                 def _sampler(logits):
                     if tp == 0:
@@ -602,7 +706,10 @@ def _start_server(cfg):
                     thinking_done = False
                     thinking_buffer = ""
 
-                    for tok, _ in generate_step(prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler, prompt_cache=cache):
+                    for tok, _ in generate_step(
+                        prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler,
+                        prompt_cache=cache, quantized_kv_start=quantized_kv_start
+                    ):
                         tid = int(tok)
                         if tid in eos_ids: break
                         tokens_out.append(tid)
@@ -659,7 +766,10 @@ def _start_server(cfg):
 
                 # Non-streaming mode
                 tokens_out = []
-                for tok, _ in generate_step(prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler, prompt_cache=cache):
+                for tok, _ in generate_step(
+                    prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler,
+                    prompt_cache=cache, quantized_kv_start=quantized_kv_start
+                ):
                     tid = int(tok)
                     if tid in eos_ids: break
                     tokens_out.append(tid)
@@ -672,7 +782,22 @@ def _start_server(cfg):
                     "usage": {"prompt_tokens": len(prompt_ids), "completion_tokens": len(tokens_out), "total_tokens": len(prompt_ids) + len(tokens_out)},
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
-                w.write(rdata.encode()); await w.drain(); return
+                w.write(rdata.encode()); await w.drain()
+
+                # Save prompt cache for future requests
+                if _prompt_cache["dir"] and not _prompt_cache["loaded"]:
+                    try:
+                        import hashlib
+                        from mlx_lm.models.cache import save_prompt_cache
+                        prompt_hash = hashlib.sha256(formatted.encode()).hexdigest()[:16]
+                        cache_file = _prompt_cache["dir"] / f"{prompt_hash}.safetensors"
+                        if not cache_file.exists():
+                            save_prompt_cache(str(cache_file), cache, {"prompt": formatted[:100]})
+                            print(f"  Saved prompt cache: {cache_file.name}")
+                    except Exception as e:
+                        print(f"  ⚠ Failed to save prompt cache: {e}")
+
+                return
 
             w.write(b"HTTP/1.1 404 Not Found\r\n\r\n"); await w.drain()
         except (ConnectionResetError, BrokenPipeError):
@@ -810,19 +935,13 @@ def main():
 
     # KV quantization for non-TurboQuant strategies (works with ALL models)
     if cfg["tq_strategy"] == "none":
-        kv_bits = cfg.get("kv_bits", 0)
-        print()
-        print("  KV-Cache quantization (MLX native, works with all models):")
-        kv_options = {"0": (0, "None — full precision FP16"), "1": (2, "2-bit — 8x compression"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression (Recommended)"), "4": (8, "8-bit — 2x compression")}
-        for k, (v, d) in kv_options.items():
-            m = " (current)" if v == kv_bits else ""
-            print(f"  {k}) [{v}-bit] — {d}{m}")
-        kv_choice = input(f"  KV bits [3]: ").strip() or "3"
-        if kv_choice in kv_options:
-            cfg["kv_bits"] = kv_options[kv_choice][0]
-        else:
-            cfg["kv_bits"] = 0
-        cfg["kv_group_size"] = cfg.get("kv_group_size", 64)
+        _pick_kv_bits(cfg)
+        _pick_quantized_kv_start(cfg)
+        _pick_prompt_cache(cfg)
+    else:
+        # TurboQuant strategies: asymmetric K/V bits
+        _pick_kv_bits(cfg)
+        _pick_quantized_kv_start(cfg)
 
     # Apply YaRN override if context > native max
     yarn_path, yarn_tmpdir = _apply_yarn_override(model["path"], cfg["ctx_size"])
@@ -846,8 +965,10 @@ def main():
     ctx = cfg['ctx_size']
     ctx_label = " (YaRN extended)" if ctx > _NATIVE_MAX_CONTEXT else ""
     print(f"  Context:     {ctx}{ctx_label}")
-    if cfg.get("kv_bits", 0) > 0 and cfg["tq_strategy"] == "none":
-        print(f"  KV Quant:    {cfg['kv_bits']}-bit (MLX native)")
+    print(f"  KV Quant:    K={cfg['k_bits']}-bit / V={cfg['v_bits']}-bit (asymmetric)")
+    print(f"  Quant Start: {cfg.get('quantized_kv_start', 512)} tokens")
+    if cfg.get("prompt_cache_dir"):
+        print(f"  Prompt Cache: {cfg['prompt_cache_dir']} (persistent)")
     print(f"  Max Tokens:  {cfg['max_tokens']}")
     print(f"  Temperature: {cfg['temperature']}")
     print("=" * 54)
