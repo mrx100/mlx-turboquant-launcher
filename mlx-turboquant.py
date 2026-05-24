@@ -911,11 +911,17 @@ def _start_server(cfg):
                 
                 # Initialize speculative decoder if enabled
                 speculative_decoder = None
+                draft_cache = None
                 if draft_model is not None:
                     from speculative_decoding import SpeculativeDecoder
+                    # Create separate cache for draft model
+                    from mlx_lm.models.cache import make_prompt_cache
+                    draft_cache = make_prompt_cache(draft_model)
                     speculative_decoder = SpeculativeDecoder(
                         draft_model=draft_model,
                         target_model=model,
+                        draft_cache=draft_cache,
+                        target_cache=cache,
                         gamma=speculative_gamma,
                     )
 
