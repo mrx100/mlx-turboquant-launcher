@@ -360,6 +360,11 @@ def _apply_yarn_override(model_path, desired_ctx):
     rope_params.setdefault("mscale", 1.0)
     rope_params.setdefault("mscale_all_dim", 0.0)
 
+    # Also update rope_scaling if present (for models with existing YaRN)
+    if "rope_scaling" in original_cfg and original_cfg["rope_scaling"]:
+        original_cfg["rope_scaling"]["factor"] = yarn_factor
+        original_cfg["rope_scaling"]["original_max_position_embeddings"] = native_max
+
     original_cfg["max_position_embeddings"] = desired_ctx
     original_cfg["rope_parameters"] = rope_params
 
@@ -448,6 +453,8 @@ def _start_server(cfg):
     strategy = cfg["tq_strategy"]
     host, port = cfg["host"], cfg["port"]
     max_tokens, temperature = cfg["max_tokens"], cfg["temperature"]
+    kv_bits = cfg.get("kv_bits", 0)
+    kv_group_size = cfg.get("kv_group_size", 64)
 
     print(f"Loading model: {model_path}")
     model, tokenizer = mlx_lm.load(model_path)
@@ -542,6 +549,7 @@ def _start_server(cfg):
                     "softmax_layers": len(softmax_indices) if is_hybrid else n_layers,
                     "gdn_layers": len(gdn_indices),
                     "head_dim": head_dim,
+                    "kv_bits": kv_bits if kv_bits > 0 else None,
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
                 w.write(rdata.encode()); await w.drain(); return
@@ -564,6 +572,17 @@ def _start_server(cfg):
                 tp = payload.get("temperature") or temperature
                 stream = payload.get("stream", False)
                 cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim)
+
+                # Apply MLX native KV quantization (works with ALL models)
+                if kv_bits > 0 and strategy == "none":
+                    try:
+                        from mlx_lm.generate import maybe_quantize_kv_cache
+                        maybe_quantize_kv_cache(cache, 0, kv_group_size, kv_bits)
+                    except Exception as e:
+                        print(f"  ⚠ KV quantization not supported for this model: {e}")
+                        print(f"  Falling back to full precision KV cache")
+                        cache, _, _, _ = _create_hybrid_cache(model, strategy, head_dim)
+
                 formatted = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 prompt_ids = mx.array(tokenizer.encode(formatted))
 
@@ -789,6 +808,22 @@ def main():
     cfg["tq_strategy"] = _pick_strategy(cfg.get("tq_strategy"), is_hybrid=is_hybrid)
     cfg["ctx_size"] = _pick_context_size(cfg, model["path"])
 
+    # KV quantization for non-TurboQuant strategies (works with ALL models)
+    if cfg["tq_strategy"] == "none":
+        kv_bits = cfg.get("kv_bits", 0)
+        print()
+        print("  KV-Cache quantization (MLX native, works with all models):")
+        kv_options = {"0": (0, "None — full precision FP16"), "1": (2, "2-bit — 8x compression"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression (Recommended)"), "4": (8, "8-bit — 2x compression")}
+        for k, (v, d) in kv_options.items():
+            m = " (current)" if v == kv_bits else ""
+            print(f"  {k}) [{v}-bit] — {d}{m}")
+        kv_choice = input(f"  KV bits [3]: ").strip() or "3"
+        if kv_choice in kv_options:
+            cfg["kv_bits"] = kv_options[kv_choice][0]
+        else:
+            cfg["kv_bits"] = 0
+        cfg["kv_group_size"] = cfg.get("kv_group_size", 64)
+
     # Apply YaRN override if context > native max
     yarn_path, yarn_tmpdir = _apply_yarn_override(model["path"], cfg["ctx_size"])
     if yarn_tmpdir:
@@ -811,6 +846,8 @@ def main():
     ctx = cfg['ctx_size']
     ctx_label = " (YaRN extended)" if ctx > _NATIVE_MAX_CONTEXT else ""
     print(f"  Context:     {ctx}{ctx_label}")
+    if cfg.get("kv_bits", 0) > 0 and cfg["tq_strategy"] == "none":
+        print(f"  KV Quant:    {cfg['kv_bits']}-bit (MLX native)")
     print(f"  Max Tokens:  {cfg['max_tokens']}")
     print(f"  Temperature: {cfg['temperature']}")
     print("=" * 54)
