@@ -59,6 +59,8 @@ Works with **every MLX model** — uses mlx-lm's built-in `to_quantized()`:
 | 4-bit | 4x | All (Recommended) |
 | 8-bit | 2x | All |
 
+**Asymmetric K/V:** Keys and Values can use different bit widths (K=4-bit, V=2-bit recommended).
+
 ### 2. TurboQuant (Qwen 3.5/3.6 only)
 Specialized for hybrid GDN+SDPA architecture:
 
@@ -67,6 +69,22 @@ Specialized for hybrid GDN+SDPA architecture:
 | tq_4bit | Qwen 3.5/3.6 | 75% on softmax layers |
 | tq_4bit_fast | Qwen 3.5/3.6 | 75% (faster) |
 | tq_3bit | Qwen 3.5/3.6 | 79% on softmax layers |
+
+**Note:** TurboQuant requires symmetric K/V bits (mx.quantized_matmul limitation).
+
+### Quantized KV Start (Prefill Optimization)
+Delays quantization until N tokens to stabilize prefill:
+- First N tokens stay in FP16 for maximum precision
+- Quantization kicks in after N tokens
+- Recommended: 512 for long contexts
+- Configurable: 0/256/512/1024
+
+### Persistent Prompt Cache
+Survives server restarts for near-zero TTFT:
+- Hash-based cache keys in `~/.mlx_prompt_cache/`
+- Auto-save after first request
+- Auto-load on subsequent requests with same prompt
+- Dramatically reduces TTFT for repeated code contexts
 
 ## YaRN Context Extension
 

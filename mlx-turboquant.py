@@ -312,35 +312,49 @@ def _pick_float(prompt, default):
     except: return default
 
 
-def _pick_kv_bits(cfg):
+def _pick_kv_bits(cfg, is_turboquant=False):
     """Select asymmetric K/V cache quantization bits.
 
-    Keys (K) are sensitive to quantization — 4-bit recommended for TurboQuant.
-    Values (V) tolerate lower precision — 2-bit works well.
+    For TurboQuant strategies: K and V must use same bits (mx.quantized_matmul requirement).
+    For MLX native (strategy=none): K and V can differ (K=4-bit, V=2-bit recommended).
     """
     k_bits = cfg.get("k_bits", 4)
     v_bits = cfg.get("v_bits", 2)
 
-    print()
-    print("  Asymmetric KV-Cache quantization:")
-    print("  Keys (K) are sensitive to quantization; Values (V) tolerate lower bits.")
-    print()
-    print("  K-bit options (Keys — used in softmax Q·K^T, needs precision):")
-    k_options = {"1": (2, "2-bit — 8x compression (aggressive)"), "2": (4, "4-bit — 4x compression (Recommended)"), "3": (8, "8-bit — 2x compression (highest quality)")}
-    for k, (v, d) in k_options.items():
-        m = " (current)" if v == k_bits else ""
-        print(f"  {k}) [{v}-bit K] — {d}{m}")
-    k_choice = input(f"  K bits [2]: ").strip() or "2"
-    cfg["k_bits"] = k_options.get(k_choice, (4, ""))[0]
+    if is_turboquant:
+        # TurboQuant requires symmetric K/V bits for mx.quantized_matmul
+        print()
+        print("  KV-Cache quantization (TurboQuant — K/V must match for quantized_matmul):")
+        kv_options = {"1": (2, "2-bit — 8x compression (aggressive)"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression (Recommended)"), "4": (8, "8-bit — 2x compression (highest quality)")}
+        for k, (v, d) in kv_options.items():
+            m = " (current)" if v == k_bits else ""
+            print(f"  {k}) [{v}-bit] — {d}{m}")
+        kv_choice = input(f"  KV bits [3]: ").strip() or "3"
+        bits = kv_options.get(kv_choice, (4, ""))[0]
+        cfg["k_bits"] = bits
+        cfg["v_bits"] = bits
+    else:
+        # MLX native supports asymmetric K/V
+        print()
+        print("  Asymmetric KV-Cache quantization (MLX native):")
+        print("  Keys (K) are sensitive to quantization; Values (V) tolerate lower bits.")
+        print()
+        print("  K-bit options (Keys — used in softmax Q·K^T, needs precision):")
+        k_options = {"1": (2, "2-bit — 8x compression (aggressive)"), "2": (4, "4-bit — 4x compression (Recommended)"), "3": (8, "8-bit — 2x compression (highest quality)")}
+        for k, (v, d) in k_options.items():
+            m = " (current)" if v == k_bits else ""
+            print(f"  {k}) [{v}-bit K] — {d}{m}")
+        k_choice = input(f"  K bits [2]: ").strip() or "2"
+        cfg["k_bits"] = k_options.get(k_choice, (4, ""))[0]
 
-    print()
-    print("  V-bit options (Values — weighted sums, more tolerant):")
-    v_options = {"1": (2, "2-bit — 8x compression (Recommended)"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression"), "4": (8, "8-bit — 2x compression (highest quality)")}
-    for k, (v, d) in v_options.items():
-        m = " (current)" if v == v_bits else ""
-        print(f"  {k}) [{v}-bit V] — {d}{m}")
-    v_choice = input(f"  V bits [1]: ").strip() or "1"
-    cfg["v_bits"] = v_options.get(v_choice, (2, ""))[0]
+        print()
+        print("  V-bit options (Values — weighted sums, more tolerant):")
+        v_options = {"1": (2, "2-bit — 8x compression (Recommended)"), "2": (3, "3-bit — 5.3x compression"), "3": (4, "4-bit — 4x compression"), "4": (8, "8-bit — 2x compression (highest quality)")}
+        for k, (v, d) in v_options.items():
+            m = " (current)" if v == v_bits else ""
+            print(f"  {k}) [{v}-bit V] — {d}{m}")
+        v_choice = input(f"  V bits [1]: ").strip() or "1"
+        cfg["v_bits"] = v_options.get(v_choice, (2, ""))[0]
 
     cfg["kv_group_size"] = cfg.get("kv_group_size", 64)
 
@@ -935,12 +949,12 @@ def main():
 
     # KV quantization for non-TurboQuant strategies (works with ALL models)
     if cfg["tq_strategy"] == "none":
-        _pick_kv_bits(cfg)
+        _pick_kv_bits(cfg, is_turboquant=False)
         _pick_quantized_kv_start(cfg)
         _pick_prompt_cache(cfg)
     else:
-        # TurboQuant strategies: asymmetric K/V bits
-        _pick_kv_bits(cfg)
+        # TurboQuant strategies: symmetric K/V bits required
+        _pick_kv_bits(cfg, is_turboquant=True)
         _pick_quantized_kv_start(cfg)
 
     # Apply YaRN override if context > native max
