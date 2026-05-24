@@ -23,7 +23,8 @@ Production-grade MLX model server with **TurboQuant KV-Cache Compression** and *
 
 ## Features
 
-- **TurboQuant KV-Cache Compression** — 4-bit/3-bit quantization on softmax layers
+- **TurboQuant KV-Cache Compression** — 4-bit/3-bit quantization on softmax layers (Qwen 3.5/3.6)
+- **MLX Native KV Quantization** — 2/3/4/8-bit for ALL models (gpt-oss, GLM, Llama, etc.)
 - **Hybrid Architecture Support** — Qwen 3.5/3.6 (GDN+SDPA) auto-detected
 - **YaRN Context Extension** — Beyond native limits (up to 1M+ tokens)
 - **OpenAI-Compatible API** — `/v1/chat/completions` endpoint
@@ -43,6 +44,29 @@ Production-grade MLX model server with **TurboQuant KV-Cache Compression** and *
 # List available models
 ./mlx-turboquant.py --list
 ```
+
+## KV-Cache Quantization
+
+Two modes available:
+
+### 1. MLX Native (all models)
+Works with **every MLX model** — uses mlx-lm's built-in `to_quantized()`:
+
+| Bits | Compression | Models |
+|------|-------------|--------|
+| 2-bit | 8x | All (gpt-oss, GLM, Llama, Mistral...) |
+| 3-bit | 5.3x | All |
+| 4-bit | 4x | All (Recommended) |
+| 8-bit | 2x | All |
+
+### 2. TurboQuant (Qwen 3.5/3.6 only)
+Specialized for hybrid GDN+SDPA architecture:
+
+| Strategy | Models | Savings |
+|----------|--------|---------|
+| tq_4bit | Qwen 3.5/3.6 | 75% on softmax layers |
+| tq_4bit_fast | Qwen 3.5/3.6 | 75% (faster) |
+| tq_3bit | Qwen 3.5/3.6 | 79% on softmax layers |
 
 ## YaRN Context Extension
 
