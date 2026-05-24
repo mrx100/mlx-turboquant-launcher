@@ -188,6 +188,9 @@ _DEFAULTS = {
     "prompt_cache_dir": None,
     "use_rotation": True, "use_normalization": True,
     "use_async_cache": True,
+    "use_speculative": False,
+    "draft_model_path": None,
+    "speculative_gamma": 4,
 }
 
 _CONTEXT_PRESETS = [
@@ -701,6 +704,11 @@ def _start_server(cfg):
     quantized_kv_start = cfg.get("quantized_kv_start", 512)
     prompt_cache_dir = cfg.get("prompt_cache_dir", None)
     use_async_cache = cfg.get("use_async_cache", True)
+    
+    # Speculative decoding config
+    use_speculative = cfg.get("use_speculative", False)
+    draft_model_path = cfg.get("draft_model_path", None)
+    speculative_gamma = cfg.get("speculative_gamma", 4)
 
     # Persistent prompt cache setup
     _prompt_cache = {"dir": None, "loaded": False}
@@ -712,6 +720,13 @@ def _start_server(cfg):
     print(f"Loading model: {model_path}")
     model, tokenizer = mlx_lm.load(model_path)
     n_layers = len(model.layers)
+    
+    # Load draft model if speculative decoding enabled
+    draft_model = None
+    if use_speculative and draft_model_path:
+        print(f"Loading draft model: {draft_model_path}")
+        draft_model, _ = mlx_lm.load(draft_model_path)
+        print(f"Draft model loaded for speculative decoding (γ={speculative_gamma})")
 
     is_hybrid, softmax_indices, gdn_indices = _detect_architecture(model)
 
@@ -893,6 +908,16 @@ def _start_server(cfg):
 
                 cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
                 eos_ids = {tokenizer.eos_token_id}
+                
+                # Initialize speculative decoder if enabled
+                speculative_decoder = None
+                if draft_model is not None:
+                    from speculative_decoding import SpeculativeDecoder
+                    speculative_decoder = SpeculativeDecoder(
+                        draft_model=draft_model,
+                        target_model=model,
+                        gamma=speculative_gamma,
+                    )
 
                 if stream:
                     header = f"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
@@ -902,6 +927,147 @@ def _start_server(cfg):
                     thinking_done = False
                     thinking_buffer = ""
 
+                    if speculative_decoder is not None:
+                        # Speculative decoding mode
+                        for tok, _ in speculative_decoder.generate_step(
+                            prompt_ids=prompt_ids,
+                            cache=cache,
+                            max_tokens=mt,
+                            sampler=_sampler,
+                        ):
+                            tid = int(tok)
+                            if tid in eos_ids: break
+                            tokens_out.append(tid)
+                            chunk_text = tokenizer.decode([tid])
+
+                            if not thinking_done:
+                                thinking_buffer += chunk_text
+                                if '</think>' in thinking_buffer:
+                                    thinking_done = True
+                                    chunk_text = thinking_buffer.split('</think>', 1)[-1]
+                                    if chunk_text.strip():
+                                        chunk = json.dumps({
+                                            "id": cmpl_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": Path(model_path).name,
+                                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                                        })
+                                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+                                elif re.match(r"^(?:.*\n)?(?:Here's\s+a\s+)?[Tt]hinking\s+[Pp]rocess:\s*\n", thinking_buffer):
+                                    lines_think = thinking_buffer.split('\n')
+                                    for line in lines_think:
+                                        s = line.strip()
+                                        if re.match(r'^\d+\.\s+', s):
+                                            continue
+                                        if s and not s.startswith('<') and len(s) > 3:
+                                            thinking_done = True
+                                            chunk_text = thinking_buffer.split(s)[0] + s
+                                            if chunk_text.strip():
+                                                chunk = json.dumps({
+                                                    "id": cmpl_id, "object": "chat.completion.chunk",
+                                                    "created": int(time.time()), "model": Path(model_path).name,
+                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                                                })
+                                                if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+                                            break
+                                    if not thinking_done:
+                                        continue
+
+                            chunk = json.dumps({
+                                "id": cmpl_id, "object": "chat.completion.chunk",
+                                "created": int(time.time()), "model": Path(model_path).name,
+                                "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                            })
+                            if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+
+                        final = json.dumps({
+                            "id": cmpl_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": Path(model_path).name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        })
+                        await safe_write(w, f"data: {final}\n\ndata: [DONE]\n\n".encode())
+                        w.close(); await w.wait_closed()
+                        duration = time.time() - req_start
+                        _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
+                        logger.info(f"Stream completed (speculative): {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
+                        return
+                    else:
+                        # Standard generation mode
+                        for tok, _ in generate_step(
+                            prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler,
+                            prompt_cache=cache, quantized_kv_start=quantized_kv_start
+                        ):
+                            tid = int(tok)
+                            if tid in eos_ids: break
+                            tokens_out.append(tid)
+                            chunk_text = tokenizer.decode([tid])
+
+                            if not thinking_done:
+                                thinking_buffer += chunk_text
+                                if '</think>' in thinking_buffer:
+                                    thinking_done = True
+                                    chunk_text = thinking_buffer.split('</think>', 1)[-1]
+                                    if chunk_text.strip():
+                                        chunk = json.dumps({
+                                            "id": cmpl_id, "object": "chat.completion.chunk",
+                                            "created": int(time.time()), "model": Path(model_path).name,
+                                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                                        })
+                                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+                                elif re.match(r"^(?:.*\n)?(?:Here's\s+a\s+)?[Tt]hinking\s+[Pp]rocess:\s*\n", thinking_buffer):
+                                    lines_think = thinking_buffer.split('\n')
+                                    for line in lines_think:
+                                        s = line.strip()
+                                        if re.match(r'^\d+\.\s+', s):
+                                            continue
+                                        if s and not s.startswith('<') and len(s) > 3:
+                                            thinking_done = True
+                                            chunk_text = thinking_buffer.split(s)[0] + s
+                                            if chunk_text.strip():
+                                                chunk = json.dumps({
+                                                    "id": cmpl_id, "object": "chat.completion.chunk",
+                                                    "created": int(time.time()), "model": Path(model_path).name,
+                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                                                })
+                                                if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+                                            break
+                                    if not thinking_done:
+                                        continue
+
+                            chunk = json.dumps({
+                                "id": cmpl_id, "object": "chat.completion.chunk",
+                                "created": int(time.time()), "model": Path(model_path).name,
+                                "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
+                            })
+                            if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
+
+                        final = json.dumps({
+                            "id": cmpl_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": Path(model_path).name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        })
+                        await safe_write(w, f"data: {final}\n\ndata: [DONE]\n\n".encode())
+                        w.close(); await w.wait_closed()
+                        duration = time.time() - req_start
+                        _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
+                        logger.info(f"Stream completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
+                        return
+
+                # Non-streaming mode
+                tokens_out = []
+                
+                if speculative_decoder is not None:
+                    # Speculative decoding mode
+                    for tok, _ in speculative_decoder.generate_step(
+                        prompt_ids=prompt_ids,
+                        cache=cache,
+                        max_tokens=mt,
+                        sampler=_sampler,
+                    ):
+                        tid = int(tok)
+                        if tid in eos_ids: break
+                        tokens_out.append(tid)
+                else:
+                    # Standard generation mode
                     for tok, _ in generate_step(
                         prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler,
                         prompt_cache=cache, quantized_kv_start=quantized_kv_start
@@ -909,82 +1075,6 @@ def _start_server(cfg):
                         tid = int(tok)
                         if tid in eos_ids: break
                         tokens_out.append(tid)
-                        chunk_text = tokenizer.decode([tid])
-
-                        if not thinking_done:
-                            thinking_buffer += chunk_text
-                            if '</think>' in thinking_buffer:
-                                thinking_done = True
-                                chunk_text = thinking_buffer.split('</think>', 1)[-1]
-                                if chunk_text.strip():
-                                    chunk = json.dumps({
-                                        "id": cmpl_id, "object": "chat.completion.chunk",
-                                        "created": int(time.time()), "model": Path(model_path).name,
-                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
-                                    })
-                                    if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
-                            elif re.match(r"^(?:.*\n)?(?:Here's\s+a\s+)?[Tt]hinking\s+[Pp]rocess:\s*\n", thinking_buffer):
-                                lines_think = thinking_buffer.split('\n')
-                                for line in lines_think:
-                                    s = line.strip()
-                                    if re.match(r'^\d+\.\s+', s):
-                                        continue
-                                    if s == '' and thinking_buffer.count('\n') < 3:
-                                        continue
-                                    if s and not re.match(r'^(?:Here\'s\s+a\s+)?[Tt]hinking\s+[Pp]rocess:', s) and not re.match(r'^\d+\.\s+', s):
-                                        thinking_done = True
-                                        chunk_text = line + '\n'
-                                        chunk = json.dumps({
-                                            "id": cmpl_id, "object": "chat.completion.chunk",
-                                            "created": int(time.time()), "model": Path(model_path).name,
-                                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
-                                        })
-                                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
-                                        break
-                                if not thinking_done:
-                                    continue
-
-                        chunk = json.dumps({
-                            "id": cmpl_id, "object": "chat.completion.chunk",
-                            "created": int(time.time()), "model": Path(model_path).name,
-                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": chunk_text}, "finish_reason": None}],
-                        })
-                        if not await safe_write(w, f"data: {chunk}\n\n".encode()): break
-
-                    final = json.dumps({
-                        "id": cmpl_id, "object": "chat.completion.chunk",
-                        "created": int(time.time()), "model": Path(model_path).name,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    })
-                    await safe_write(w, f"data: {final}\n\ndata: [DONE]\n\n".encode())
-                    w.close(); await w.wait_closed()
-                    duration = time.time() - req_start
-                    _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
-                    logger.info(f"Stream completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
-
-                    # Collect async cache statistics
-                    if use_async_cache:
-                        async_ops = 0
-                        async_fallbacks = 0
-                        for c in cache:
-                            if hasattr(c, 'async_stats'):
-                                async_ops += c.async_stats.get('async_ops_count', 0)
-                                async_fallbacks += c.async_stats.get('sync_fallback_count', 0)
-                        _server_stats.async_quant_ops = async_ops
-                        _server_stats.async_sync_fallbacks = async_fallbacks
-                        if async_ops > 0:
-                            logger.info(f"  Async quantization: {async_ops} ops, {async_fallbacks} sync fallbacks")
-                    return
-
-                # Non-streaming mode
-                tokens_out = []
-                for tok, _ in generate_step(
-                    prompt=prompt_ids, model=model, max_tokens=mt, sampler=_sampler,
-                    prompt_cache=cache, quantized_kv_start=quantized_kv_start
-                ):
-                    tid = int(tok)
-                    if tid in eos_ids: break
-                    tokens_out.append(tid)
 
                 text = _strip_thinking(tokenizer.decode(tokens_out))
                 resp = json.dumps({
@@ -1185,6 +1275,24 @@ def main():
 
     cfg["max_tokens"] = _pick_int("Max tokens per request", cfg["max_tokens"])
     cfg["temperature"] = _pick_float("Default temperature", cfg["temperature"])
+    
+    # Speculative decoding setup
+    print()
+    print("  Speculative Decoding (30-50% speedup)")
+    print("  Uses a smaller draft model to generate tokens,")
+    print("  target model verifies for 30-50% speedup.")
+    print()
+    if input("  Enable speculative decoding? [y/N]: ").strip().lower() == "y":
+        cfg["use_speculative"] = True
+        draft_path = input("  Draft model path [~/.lmstudio/models/Qwen2.5-1.5B-Instruct]: ").strip()
+        if not draft_path:
+            draft_path = os.path.expanduser("~/.lmstudio/models/Qwen2.5-1.5B-Instruct")
+        cfg["draft_model_path"] = draft_path
+        cfg["speculative_gamma"] = _pick_int("  Draft tokens per step (γ)", cfg.get("speculative_gamma", 4))
+        print(f"  ✓ Speculative decoding enabled (γ={cfg['speculative_gamma']})")
+    else:
+        cfg["use_speculative"] = False
+        cfg["draft_model_path"] = None
 
     print()
     print("=" * 54)
@@ -1201,6 +1309,8 @@ def main():
     print(f"  Quant Start: {cfg.get('quantized_kv_start', 512)} tokens")
     if cfg.get("prompt_cache_dir"):
         print(f"  Prompt Cache: {cfg['prompt_cache_dir']} (persistent)")
+    if cfg.get("use_speculative"):
+        print(f"  Speculative: ENABLED (draft={Path(cfg['draft_model_path']).name}, γ={cfg['speculative_gamma']})")
     print(f"  Max Tokens:  {cfg['max_tokens']}")
     print(f"  Temperature: {cfg['temperature']}")
     print("=" * 54)
