@@ -24,8 +24,150 @@ except ImportError:
         print("✗ mlx_lm not found. Install it or set the venv path in the script.")
         sys.exit(1)
 
-import os, sys, json, time, uuid, asyncio, re, shutil, atexit, signal
+import os, sys, json, time, uuid, asyncio, re, shutil, atexit, signal, logging, traceback
 from pathlib import Path
+from datetime import datetime
+
+# ── Logging Setup ───────────────────────────────────────────────────
+
+_LOG_DIR = Path.home() / ".mlx-turboquant"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "server.log"
+_STATS_FILE = _LOG_DIR / "stats.json"
+
+# Rotating file handler (10MB max, 5 backups)
+class RotatingFileHandler(logging.FileHandler):
+    def __init__(self, filename, max_bytes=10*1024*1024, backup_count=5):
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        super().__init__(filename, mode='a')
+
+    def emit(self, record):
+        if self.stream and hasattr(self.stream, 'tell'):
+            try:
+                self.stream.seek(0, 2)
+                if self.stream.tell() >= self.max_bytes:
+                    self.stream.close()
+                    self._rotate()
+                    self.stream = self._open()
+            except: pass
+        super().emit(record)
+
+    def _rotate(self):
+        for i in range(self.backup_count, 0, -1):
+            src = Path(f"{self.baseFilename}.{i}")
+            dst = Path(f"{self.baseFilename}.{i+1}")
+            if src.exists():
+                src.rename(dst)
+        Path(self.baseFilename).rename(Path(f"{self.baseFilename}.1"))
+
+logger = logging.getLogger("turboquant")
+logger.setLevel(logging.DEBUG)
+fh = RotatingFileHandler(str(_LOG_FILE), max_bytes=10*1024*1024, backup_count=5)
+fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+logger.addHandler(fh)
+
+# Console handler for important messages
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(ch)
+
+# ── Server Statistics ──────────────────────────────────────────────
+
+class ServerStats:
+    """Tracks server performance metrics."""
+
+    def __init__(self):
+        self.start_time = time.time()
+        self.total_requests = 0
+        self.total_tokens_generated = 0
+        self.total_errors = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.connection_resets = 0
+        self.bad_requests = 0
+        self.avg_tokens_per_second = 0.0
+        self.last_request_time = None
+        self.last_error = None
+        self.requests_by_status = {"200": 0, "400": 0, "500": 0}
+
+    def record_request(self, status_code, tokens=0, duration=0):
+        self.total_requests += 1
+        self.last_request_time = time.time()
+        status_key = str(status_code)
+        if status_key in self.requests_by_status:
+            self.requests_by_status[status_key] += 1
+        if tokens > 0:
+            self.total_tokens_generated += tokens
+            elapsed = time.time() - self.start_time
+            if elapsed > 0:
+                self.avg_tokens_per_second = self.total_tokens_generated / elapsed
+
+    def record_cache_hit(self):
+        self.cache_hits += 1
+
+    def record_cache_miss(self):
+        self.cache_misses += 1
+
+    def record_error(self, error_msg):
+        self.total_errors += 1
+        self.last_error = error_msg
+        self.requests_by_status["500"] += 1
+        logger.error(f"Error #{self.total_errors}: {error_msg}")
+
+    def record_bad_request(self):
+        self.bad_requests += 1
+        self.requests_by_status["400"] += 1
+
+    def record_connection_reset(self):
+        self.connection_resets += 1
+
+    def get_summary(self):
+        uptime = time.time() - self.start_time
+        hours = int(uptime // 3600)
+        mins = int((uptime % 3600) // 60)
+        secs = int(uptime % 60)
+        return {
+            "uptime": f"{hours}h {mins}m {secs}s",
+            "total_requests": self.total_requests,
+            "total_tokens_generated": self.total_tokens_generated,
+            "avg_tokens_per_second": round(self.avg_tokens_per_second, 1),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": f"{self.cache_hits / max(self.cache_hits + self.cache_misses, 1) * 100:.1f}%",
+            "errors": self.total_errors,
+            "connection_resets": self.connection_resets,
+            "bad_requests": self.bad_requests,
+            "requests_by_status": dict(self.requests_by_status),
+            "last_error": self.last_error,
+        }
+
+    def save(self):
+        try:
+            _STATS_FILE.write_text(json.dumps(self.get_summary(), indent=2))
+        except: pass
+
+    def print_summary(self):
+        s = self.get_summary()
+        logger.info("=" * 60)
+        logger.info("  SERVER STATISTICS")
+        logger.info("=" * 60)
+        logger.info(f"  Uptime:          {s['uptime']}")
+        logger.info(f"  Total Requests:  {s['total_requests']}")
+        logger.info(f"  Tokens Generated: {s['total_tokens_generated']}")
+        logger.info(f"  Avg Tokens/s:    {s['avg_tokens_per_second']}")
+        logger.info(f"  Cache Hits:      {s['cache_hits']} ({s['cache_hit_rate']})")
+        logger.info(f"  Cache Misses:    {s['cache_misses']}")
+        logger.info(f"  Errors:          {s['errors']}")
+        logger.info(f"  Connection Resets: {s['connection_resets']}")
+        logger.info(f"  Bad Requests:    {s['bad_requests']}")
+        if s.get('last_error'):
+            logger.info(f"  Last Error:      {s['last_error']}")
+        logger.info("=" * 60)
+
+
+_server_stats = ServerStats()
 
 _MODELS_DIR = Path.home() / ".lmstudio/models"
 _CONFIG_FILE = Path.home() / ".tq_defaults.json"
@@ -620,6 +762,7 @@ def _start_server(cfg):
             return False
 
     async def handle(r, w):
+        req_start = time.time()
         try:
             data = await asyncio.wait_for(r.read(65536), timeout=300)
             if not data: return
@@ -648,23 +791,40 @@ def _start_server(cfg):
                     "v_bits": v_bits,
                     "quantized_kv_start": quantized_kv_start,
                     "prompt_cache": bool(_prompt_cache["dir"]),
+                    "stats": _server_stats.get_summary(),
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
-                w.write(rdata.encode()); await w.drain(); return
+                w.write(rdata.encode()); await w.drain()
+                _server_stats.record_request(200)
+                return
 
             if path == "/v1/models":
                 resp = json.dumps({"object": "list", "data": [{
                     "id": Path(model_path).name, "object": "model", "owned_by": "turboquant",
                 }]})
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
-                w.write(rdata.encode()); await w.drain(); return
+                w.write(rdata.encode()); await w.drain()
+                _server_stats.record_request(200)
+                return
+
+            if path == "/stats" and method == "GET":
+                resp = json.dumps(_server_stats.get_summary(), indent=2)
+                rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
+                w.write(rdata.encode()); await w.drain()
+                return
 
             if path == "/v1/chat/completions" and method == "POST":
                 try: payload = json.loads(body)
-                except: w.write(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid JSON"); await w.drain(); return
+                except:
+                    _server_stats.record_bad_request()
+                    logger.warning(f"Bad request: Invalid JSON")
+                    w.write(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid JSON"); await w.drain(); return
 
                 msgs = payload.get("messages", [])
-                if not msgs: w.write(b"HTTP/1.1 400 Bad Request\r\n\r\nNo messages"); await w.drain(); return
+                if not msgs:
+                    _server_stats.record_bad_request()
+                    logger.warning(f"Bad request: No messages")
+                    w.write(b"HTTP/1.1 400 Bad Request\r\n\r\nNo messages"); await w.drain(); return
 
                 mt = payload.get("max_tokens") or max_tokens
                 tp = payload.get("temperature") or temperature
@@ -699,10 +859,14 @@ def _start_server(cfg):
                                         if hasattr(c, 'keys') and c.keys is not None:
                                             cache[i].keys = c.keys
                                             cache[i].values = c.values
-                                print(f"  Loaded prompt cache: {cache_file.name}")
+                                logger.info(f"Loaded prompt cache: {cache_file.name}")
+                                _server_stats.record_cache_hit()
                                 _prompt_cache["loaded"] = True
                         except Exception as e:
-                            print(f"  ⚠ Failed to load prompt cache: {e}")
+                            logger.warning(f"Failed to load prompt cache: {e}")
+                            _server_stats.record_cache_miss()
+                    else:
+                        _server_stats.record_cache_miss()
 
                 def _sampler(logits):
                     if tp == 0:
@@ -776,6 +940,9 @@ def _start_server(cfg):
                     })
                     await safe_write(w, f"data: {final}\n\ndata: [DONE]\n\n".encode())
                     w.close(); await w.wait_closed()
+                    duration = time.time() - req_start
+                    _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
+                    logger.info(f"Stream completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
                     return
 
                 # Non-streaming mode
@@ -797,6 +964,9 @@ def _start_server(cfg):
                 })
                 rdata = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}"
                 w.write(rdata.encode()); await w.drain()
+                duration = time.time() - req_start
+                _server_stats.record_request(200, tokens=len(tokens_out), duration=duration)
+                logger.info(f"Request completed: {len(tokens_out)} tokens in {duration:.2f}s ({len(tokens_out)/max(duration,0.01):.1f} tok/s)")
 
                 # Save prompt cache for future requests
                 if _prompt_cache["dir"] and not _prompt_cache["loaded"]:
@@ -807,19 +977,21 @@ def _start_server(cfg):
                         cache_file = _prompt_cache["dir"] / f"{prompt_hash}.safetensors"
                         if not cache_file.exists():
                             save_prompt_cache(str(cache_file), cache, {"prompt": formatted[:100]})
-                            print(f"  Saved prompt cache: {cache_file.name}")
+                            logger.info(f"Saved prompt cache: {cache_file.name}")
+                            _server_stats.record_cache_hit()
                     except Exception as e:
-                        print(f"  ⚠ Failed to save prompt cache: {e}")
+                        logger.warning(f"Failed to save prompt cache: {e}")
 
                 return
 
             w.write(b"HTTP/1.1 404 Not Found\r\n\r\n"); await w.drain()
         except (ConnectionResetError, BrokenPipeError):
-            pass  # Client disconnected — normal, don't log
+            _server_stats.record_connection_reset()
+            logger.debug("Client disconnected")
         except Exception as e:
-            import traceback
             tb = traceback.format_exc()
-            print(f"ERROR: {e}\n{tb}", flush=True)
+            _server_stats.record_error(str(e))
+            logger.error(f"Request error: {e}\n{tb}")
             try:
                 eb = json.dumps({"error": str(e)})
                 w.write(f"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {len(eb)}\r\n\r\n{eb}".encode())
@@ -835,6 +1007,8 @@ def _start_server(cfg):
 
         def _signal_handler():
             print("\n  Shutting down gracefully...")
+            _server_stats.print_summary()
+            _server_stats.save()
             shutdown_event.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
