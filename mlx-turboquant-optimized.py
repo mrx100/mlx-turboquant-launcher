@@ -273,6 +273,10 @@ class GDNPassThroughCache:
     def keys(self):
         return None
 
+    @property
+    def values(self):
+        return None
+
     @values.setter
     def values(self, val):
         pass
