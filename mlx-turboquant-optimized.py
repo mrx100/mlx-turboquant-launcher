@@ -386,8 +386,8 @@ def _pick_strategy(cur=None, is_hybrid=False):
     while True:
         try:
             n = _pick_int("  Select strategy", 2 if is_hybrid else 3)
-            if n in strategies:
-                return strategies[n][0]
+            if str(n) in strategies:
+                return strategies[str(n)][0]
         except:
             pass
 
