@@ -456,12 +456,24 @@ def _apply_yarn_override(model_path, desired_ctx):
     cfg_path = Path(tmpdir) / "config.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())
-        scale = desired_ctx / _NATIVE_MAX_CONTEXT
+        
+        # Find native max position embeddings (check top-level and text_config)
+        native_max = cfg.get("max_position_embeddings")
+        if native_max is None:
+            tc = cfg.get("text_config", {})
+            if isinstance(tc, dict):
+                native_max = tc.get("max_position_embeddings", _NATIVE_MAX_CONTEXT)
+            else:
+                native_max = _NATIVE_MAX_CONTEXT
+        
+        scale = desired_ctx / native_max
         cfg["rope_scaling"] = {
             "type": "yarn",
             "factor": scale,
-            "original_max_position_embeddings": _NATIVE_MAX_CONTEXT,
+            "original_max_position_embeddings": native_max,
         }
+        # Set top-level max_position_embeddings for transformers validation
+        cfg["max_position_embeddings"] = desired_ctx
         cfg_path.write_text(json.dumps(cfg, indent=2))
 
     return tmpdir, tmpdir
